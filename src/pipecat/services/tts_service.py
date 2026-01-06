@@ -55,6 +55,7 @@ from pipecat.utils.text.base_text_aggregator import BaseTextAggregator
 from pipecat.utils.text.base_text_filter import BaseTextFilter
 from pipecat.utils.text.simple_text_aggregator import SimpleTextAggregator
 from pipecat.utils.time import seconds_to_nanoseconds
+from pipecat.utils.tracing.setup import is_tracing_available
 
 
 class TTSService(AIService):
@@ -120,6 +121,10 @@ class TTSService(AIService):
         text_filter: Optional[BaseTextFilter] = None,
         # Audio transport destination of the generated frames.
         transport_destination: Optional[str] = None,
+        # If True, stop processing metrics immediately after run_tts() completes.
+        # WebSocket-based services should set this to False and call stop_processing_metrics()
+        # manually when TTS generation actually completes.
+        sync_processing_metrics: bool = True,
         **kwargs,
     ):
         """Initialize the TTS service.
@@ -151,6 +156,9 @@ class TTSService(AIService):
                     Use `text_filters` instead, which allows multiple filters.
 
             transport_destination: Destination for generated audio frames.
+            sync_processing_metrics: Whether to stop processing metrics immediately after
+                run_tts() completes. WebSocket-based services should set this to False and
+                call stop_processing_metrics() manually when TTS generation actually completes.
             **kwargs: Additional arguments passed to the parent AIService.
         """
         super().__init__(**kwargs)
@@ -183,6 +191,7 @@ class TTSService(AIService):
         # TODO: Deprecate _text_filters when added to LLMTextProcessor
         self._text_filters: Sequence[BaseTextFilter] = text_filters or []
         self._transport_destination: Optional[str] = transport_destination
+        self._sync_processing_metrics: bool = sync_processing_metrics
         self._tracing_enabled: bool = False
 
         if text_filter:
@@ -285,6 +294,40 @@ class TTSService(AIService):
     async def flush_audio(self):
         """Flush any buffered audio data."""
         pass
+
+    async def _end_tts_span(self):
+        """End the TTS tracing span with final metrics.
+
+        Called by WebSocket-based TTS services when processing completes.
+        This should be called after stop_processing_metrics() to ensure
+        accurate duration is captured.
+
+        For async TTS services (sync_processing_metrics=False), the span is
+        created in the @traced_tts decorator but kept open until this method
+        is called.
+        """
+        if not is_tracing_available():
+            return
+
+        span = getattr(self, "_current_tts_span", None)
+        if span is None:
+            return
+
+        try:
+            # Add final metrics to span
+            if hasattr(self, "_metrics"):
+                ttfb = getattr(self._metrics, "ttfb", None)
+                if ttfb is not None:
+                    span.set_attribute("metrics.ttfb", ttfb)
+
+                processing_duration = getattr(self._metrics, "processing_duration", None)
+                if processing_duration is not None:
+                    span.set_attribute("metrics.processing_duration", processing_duration)
+        except Exception as e:
+            logger.warning(f"Error setting TTS span metrics: {e}")
+        finally:
+            span.end()
+            self._current_tts_span = None
 
     async def start(self, frame: StartFrame):
         """Start the TTS service.
@@ -605,7 +648,11 @@ class TTSService(AIService):
                 transformed_text = await transform(transformed_text, type)
         await self.process_generator(self.run_tts(transformed_text))
 
-        await self.stop_processing_metrics()
+        # Only stop processing metrics here for synchronous TTS services.
+        # WebSocket-based services set _sync_processing_metrics=False and call
+        # stop_processing_metrics() when TTS generation actually completes.
+        if self._sync_processing_metrics:
+            await self.stop_processing_metrics()
 
         if self._push_text_frames:
             # In TTS services that support word timestamps, the TTSTextFrames
@@ -852,7 +899,10 @@ class WebsocketWordTTSService(WordTTSService, WebsocketService):
             reconnect_on_error: Whether to automatically reconnect on websocket errors.
             **kwargs: Additional arguments passed to parent classes.
         """
-        WordTTSService.__init__(self, **kwargs)
+        # WebSocket TTS services are async - run_tts() returns before audio arrives.
+        # Set sync_processing_metrics=False so services manually call stop_processing_metrics()
+        # and _end_tts_span() when TTS generation actually completes.
+        WordTTSService.__init__(self, sync_processing_metrics=False, **kwargs)
         WebsocketService.__init__(self, reconnect_on_error=reconnect_on_error, **kwargs)
 
     async def _report_error(self, error: ErrorFrame):

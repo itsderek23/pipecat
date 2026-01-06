@@ -529,6 +529,7 @@ class CartesiaTTSService(AudioContextWordTTSService):
     async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
         await super()._handle_interruption(frame, direction)
         await self.stop_all_metrics()
+        await self._end_tts_span()
         if self._context_id:
             cancel_msg = json.dumps({"context_id": self._context_id, "cancel": True})
             await self._get_websocket().send(cancel_msg)
@@ -550,6 +551,8 @@ class CartesiaTTSService(AudioContextWordTTSService):
                 continue
             if msg["type"] == "done":
                 await self.stop_ttfb_metrics()
+                await self.stop_processing_metrics()
+                await self._end_tts_span()
                 await self.add_word_timestamps([("TTSStoppedFrame", 0), ("Reset", 0)])
                 await self.remove_audio_context(msg["context_id"])
             elif msg["type"] == "timestamps":
@@ -570,6 +573,7 @@ class CartesiaTTSService(AudioContextWordTTSService):
             elif msg["type"] == "error":
                 await self.push_frame(TTSStoppedFrame())
                 await self.stop_all_metrics()
+                await self._end_tts_span()
                 await self.push_error(error_msg=f"Error: {msg}")
                 self._context_id = None
             else:

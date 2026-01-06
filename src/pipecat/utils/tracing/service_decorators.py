@@ -139,9 +139,13 @@ def traced_tts(func: Optional[Callable] = None, *, name: Optional[str] = None) -
     - Service name and model information
     - Voice ID and settings
     - Character count and text content
-    - Performance metrics like TTFB
+    - Performance metrics like TTFB and processing duration
 
     Works with both async functions and generators.
+
+    For WebSocket-based TTS services that set sync_processing_metrics=False,
+    the span is kept open and must be closed by calling _end_tts_span()
+    when processing completes.
 
     Args:
         func: The TTS method to trace.
@@ -156,9 +160,57 @@ def traced_tts(func: Optional[Callable] = None, *, name: Optional[str] = None) -
     def decorator(f):
         is_async_generator = inspect.isasyncgenfunction(f)
 
+        def _start_async_tts_span(self, text):
+            """Start a TTS span for async services (kept open until _end_tts_span is called).
+
+            Args:
+                self: The TTS service instance.
+                text: The text being synthesized.
+
+            Returns:
+                The created span, or None if tracing is disabled.
+            """
+            if not getattr(self, "_tracing_enabled", False):
+                return None
+
+            service_class_name = self.__class__.__name__
+            span_name = "tts"
+
+            # Get parent context
+            turn_context = get_current_turn_context()
+            parent_context = turn_context or _get_parent_service_context(self)
+
+            # Create span without using context manager (will be ended manually)
+            tracer = trace.get_tracer("pipecat")
+            span = tracer.start_span(span_name, context=parent_context)
+
+            # Store span reference on service instance for later completion
+            self._current_tts_span = span
+
+            try:
+                add_tts_span_attributes(
+                    span=span,
+                    service_name=service_class_name,
+                    model=getattr(self, "model_name", "unknown"),
+                    voice_id=getattr(self, "_voice_id", "unknown"),
+                    text=text,
+                    settings=getattr(self, "_settings", {}),
+                    character_count=len(text),
+                    operation_name="tts",
+                    cartesia_version=getattr(self, "_cartesia_version", None),
+                    context_id=getattr(self, "_context_id", None),
+                )
+            except Exception as e:
+                logging.warning(f"Error setting TTS span attributes: {e}")
+
+            return span
+
         @contextlib.asynccontextmanager
         async def tracing_context(self, text):
-            """Async context manager for TTS tracing.
+            """Async context manager for synchronous TTS tracing.
+
+            Used for TTS services where run_tts() completes synchronously
+            (i.e., sync_processing_metrics=True).
 
             Args:
                 self: The TTS service instance.
@@ -202,10 +254,15 @@ def traced_tts(func: Optional[Callable] = None, *, name: Optional[str] = None) -
                     logging.warning(f"Error in TTS tracing: {e}")
                     raise
                 finally:
-                    # Update TTFB metric at the end
+                    # Update metrics at the end
                     ttfb: Optional[float] = getattr(getattr(self, "_metrics", None), "ttfb", None)
                     if ttfb is not None:
                         span.set_attribute("metrics.ttfb", ttfb)
+                    processing_duration: Optional[float] = getattr(
+                        getattr(self, "_metrics", None), "processing_duration", None
+                    )
+                    if processing_duration is not None:
+                        span.set_attribute("metrics.processing_duration", processing_duration)
 
         if is_async_generator:
 
@@ -218,9 +275,21 @@ def traced_tts(func: Optional[Callable] = None, *, name: Optional[str] = None) -
                             yield item
                         return
 
-                    async with tracing_context(self, text):
+                    # Check if this is an async TTS service (WebSocket-based)
+                    # For async TTS, we start the span but don't close it here -
+                    # it will be closed by _end_tts_span() when processing completes
+                    is_async_tts = not getattr(self, "_sync_processing_metrics", True)
+
+                    if is_async_tts:
+                        # Start span but don't close it (will be closed by _end_tts_span)
+                        _start_async_tts_span(self, text)
                         async for item in f(self, text, *args, **kwargs):
                             yield item
+                    else:
+                        # Sync TTS: use context manager to auto-close span
+                        async with tracing_context(self, text):
+                            async for item in f(self, text, *args, **kwargs):
+                                yield item
                 except Exception as e:
                     logging.error(f"Error in TTS tracing (continuing without tracing): {e}")
                     # If tracing fails, fall back to the original function
@@ -237,8 +306,17 @@ def traced_tts(func: Optional[Callable] = None, *, name: Optional[str] = None) -
                     if not getattr(self, "_tracing_enabled", False):
                         return await f(self, text, *args, **kwargs)
 
-                    async with tracing_context(self, text):
+                    # Check if this is an async TTS service (WebSocket-based)
+                    is_async_tts = not getattr(self, "_sync_processing_metrics", True)
+
+                    if is_async_tts:
+                        # Start span but don't close it (will be closed by _end_tts_span)
+                        _start_async_tts_span(self, text)
                         return await f(self, text, *args, **kwargs)
+                    else:
+                        # Sync TTS: use context manager to auto-close span
+                        async with tracing_context(self, text):
+                            return await f(self, text, *args, **kwargs)
                 except Exception as e:
                     logging.error(f"Error in TTS tracing (continuing without tracing): {e}")
                     # If tracing fails, fall back to the original function

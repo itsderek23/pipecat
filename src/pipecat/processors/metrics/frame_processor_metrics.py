@@ -44,6 +44,7 @@ class FrameProcessorMetrics(BaseObject):
         self._start_ttfb_time = 0
         self._start_processing_time = 0
         self._last_ttfb_time = 0
+        self._last_processing_duration = 0
         self._should_report_ttfb = True
 
     async def setup(self, task_manager: BaseTaskManager):
@@ -80,6 +81,22 @@ class FrameProcessorMetrics(BaseObject):
         # If TTFB is in progress, calculate current value
         if self._start_ttfb_time > 0:
             return time.time() - self._start_ttfb_time
+
+        return None
+
+    @property
+    def processing_duration(self) -> Optional[float]:
+        """Get the last processing duration in seconds.
+
+        Returns:
+            The processing duration in seconds, or None if not measured.
+        """
+        if self._last_processing_duration > 0:
+            return self._last_processing_duration
+
+        # If processing is in progress, calculate current value
+        if self._start_processing_time > 0:
+            return time.time() - self._start_processing_time
 
         return None
 
@@ -149,6 +166,7 @@ class FrameProcessorMetrics(BaseObject):
             return None
 
         value = time.time() - self._start_processing_time
+        self._last_processing_duration = value  # Store for later access (e.g., by OTel spans)
         logger.debug(f"{self._processor_name()} processing time: {value}")
         processing = ProcessingMetricsData(
             processor=self._processor_name(), value=value, model=self._model_name()
